@@ -961,6 +961,15 @@ function tick(){
   $("d-acc").className = "dot " + (acc === null ? "" : acc <= 5 ? "ok" : acc <= 15 ? "warn" : "bad");
   $("v-gps").textContent = S.gps.n ? S.gpsHz.toFixed(1)+" Hz" : "--";
   $("d-gps").className = "dot " + (S.gps.n ? (S.gpsHz > 0.7 ? "ok" : "warn") : "bad");
+  // keep the standing-by hint honest about whether the fix is good enough to arm
+  if(S.phase === "idle" && S.started && acc !== null){
+    var msg = acc <= 5  ? "Fix is good. Stop completely, then tap Arm."
+            : acc <= 25 ? "Usable fix (±"+Math.round(acc)+" m). Open sky will tighten it."
+            : "Fix too fuzzy (±"+Math.round(acc)+" m) to arm — wait for green.";
+    if(!S.imuEver) msg += " GPS-only timing.";
+    if(msg !== S.lastHint){ hint(msg, acc > 25); S.lastHint = msg; }
+  }
+
   $("v-imu").textContent = S.imuHz ? Math.round(S.imuHz)+" Hz" : (S.started && !S.imuEver ? "off" : "--");
   $("d-imu").className = "dot " + (S.imuHz > 40 ? "ok" : S.imuHz > 0 ? "warn" : (S.started && !S.imuEver ? "warn" : "bad"));
 
