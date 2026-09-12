@@ -336,7 +336,9 @@ var DIST = [
   {k:"1/8 mile",  m:201.168, imp:1, trap:1},
   {k:"1000 ft",   m:304.8,   imp:1},
   {k:"400 m",     m:400,     met:1, trap:1},
-  {k:"1/4 mile",  m:402.336, imp:1, trap:1, mph:1}
+  {k:"1/4 mile",  m:402.336, imp:1, trap:1, mph:1},
+  {k:"1/2 mile",  m:804.672, imp:1, trap:1, mph:1},
+  {k:"1000 m",    m:1000,    met:1, trap:1}
 ];
 var SPD_KMH = [50,60,80,100,130,160,200];
 var SPD_MPH = [30,50,60,80,100,120];
@@ -351,7 +353,7 @@ var S = {
   perfOff: performance.now() - Date.now(),
   g0:null, gN:0,             // gravity reference vector + sample count
   fwd:null,                  // forward unit vector, set at launch
-  v:0, s:0, bias:0,          // fused speed (m/s), distance (m), accel bias
+  v:0, s:0, bias:0, vpk:0,   // fused speed (m/s), distance (m), accel bias, peak speed
   lastT:0,
   buf:[],                    // pre-launch ring buffer of {t, h:[x,y,z], mag}
   samples:[],                // during run: {t, v, s}
@@ -402,9 +404,10 @@ function deviceName(){
    demo run so the page opens in a working state
    ============================================================ */
 function demoRun(){
-  // curve fitted to a plausible hot-hatch pass: ~6.3 s to 100, 400 m in ~14.5 s
+  // curve fitted to a plausible hot-hatch pass: ~6.3 s to 100, 400 m in ~14.5 s.
+  // Carried out past 1000 m so every distance on the slip has a figure.
   var pk = 54.33, tc = 8.8, samples = [], t = 0, v = 0, s = 0;
-  while(t < 16.6){
+  while(t < 29.5){
     var target = pk * (1 - Math.exp(-t/tc));
     v = target * (1 - 0.055*Math.exp(-t/0.35));
     s += v * 0.02;
@@ -527,10 +530,11 @@ function onMotion(e){
     S.samples.push({t:t, v:S.v, s:S.s});
     S.vHist.push({t:now, v:S.v});
     if(S.vHist.length > 400) S.vHist.shift();
-    if(t > 45){ finishRun(); return; }
-    if(t > 3 && S.v < 0.8){ finishRun(); return; }
-    var last = DIST[DIST.length-1].m;
-    if(S.s > last + 12){ finishRun(); return; }
+    if(S.v > S.vpk) S.vpk = S.v;
+    if(t > 60){ finishRun(); return; }                        // hard ceiling
+    if(t > 3 && S.v < 0.8){ finishRun(); return; }             // rolled to a stop
+    if(t > 2 && S.vpk - S.v > 2.2){ finishRun(); return; }     // lifted off
+    if(S.s > DIST[DIST.length-1].m + 12){ finishRun(); return; }
   }
 }
 
@@ -555,7 +559,7 @@ function detectLaunch(now){
     t0 = S.buf[i].t;
   }
 
-  S.t0 = t0; S.v = 0; S.s = 0; S.bias = 0; S.divT = 0; S.lastCorr = 0;
+  S.t0 = t0; S.v = 0; S.s = 0; S.bias = 0; S.divT = 0; S.lastCorr = 0; S.vpk = 0;
   S.samples = [{t:0, v:0, s:0}]; S.vHist = [];
   setPhase("running");
   hint("Recording…");
@@ -642,6 +646,7 @@ function gpsSample(t, v){
       if(S.t0 < a.t) S.t0 = a.t;
       if(S.t0 > b.t) S.t0 = b.t;
       S.samples = [{t:0, v:0, s:0}];
+      S.vpk = 0;
       setPhase("running");
       hint("Recording — GPS only…");
       gpsRebuild();
@@ -669,8 +674,12 @@ function gpsRebuild(){
   S.samples = sm;
   S.v = vPrev; S.s = s;
 
-  var last = DIST[DIST.length-1].m;
-  if(end > 45 || (end > 3 && vPrev < 1) || s > last + 12) finishRun();
+  var pk = 0;
+  for(i=0;i<sm.length;i++) if(sm[i].v > pk) pk = sm[i].v;
+  if(end > 60                              // hard ceiling
+  || (end > 3 && vPrev < 1)                // rolled to a stop
+  || (end > 2 && pk - vPrev > 2.2)         // lifted off
+  || s > DIST[DIST.length-1].m + 12) finishRun();
 }
 
 function onPos(p){
@@ -747,7 +756,7 @@ function hint(t, bad){ var h=$("hint"); h.textContent = t || ""; h.classList.tog
 
 function abort(msg){
   if(S.launchCheck) clearTimeout(S.launchCheck);
-  S.samples = []; S.buf = []; S.v = 0; S.s = 0; S.divT = 0;
+  S.samples = []; S.buf = []; S.v = 0; S.s = 0; S.divT = 0; S.vpk = 0;
   setPhase("armed");
   hint(msg || "Aborted.", true);
 }
@@ -758,7 +767,7 @@ function arm(){
   if(S.gps.v !== null && kmh(S.gps.v) > 5){ hint("Come to a complete stop first.", true); return; }
   if(S.launchCheck) clearTimeout(S.launchCheck);
   S.buf = []; S.samples = []; S.gpsTrack = []; S.v = 0; S.s = 0; S.bias = 0; S.gN = 0;
-  S.divT = 0; S.lastCorr = 0;
+  S.divT = 0; S.lastCorr = 0; S.vpk = 0;
   S.mode = S.imuHz > 10 ? "imu" : "gps";
   S.tArm = performance.now()/1000;
   setPhase("armed");
@@ -1007,15 +1016,17 @@ function slipText(r){
   return L.join("\n");
 }
 function csvText(){
-  var rows = ["when,device,units,rollout,0-100kmh,0-60mph,60ft,100m,1/8mi,400m,1/4mi,trap_400m_kmh,peak_kmh"];
+  var rows = ["when,device,mode,units,rollout,0-100kmh,0-60mph,60ft,100m,1/8mi,400m,1/4mi,1/2mi,1000m,trap_400m_kmh,trap_1000m_kmh,peak_kmh"];
   for(var i=0;i<S.runs.length;i++){
     var r = S.runs[i];
     function d(k){ return r.dist[k] ? f2(r.dist[k].t) : ""; }
-    var q = r.dist["400 m"];
-    rows.push([new Date(r.when).toISOString(), r.dev, r.units, r.rollout?1:0,
+    var q = r.dist["400 m"], km = r.dist["1000 m"];
+    rows.push([new Date(r.when).toISOString(), r.dev, r.mode || "imu", r.units, r.rollout?1:0,
                r.spd[100]!=null?f2(r.spd[100]):"", r.spd[60]!=null?f2(r.spd[60]):"",
                d("60 ft"), d("100 m"), d("1/8 mile"), d("400 m"), d("1/4 mile"),
-               q?kmh(q.v).toFixed(1):"", kmh(r.vmax).toFixed(1)].join(","));
+               d("1/2 mile"), d("1000 m"),
+               q?kmh(q.v).toFixed(1):"", km?kmh(km.v).toFixed(1):"",
+               kmh(r.vmax).toFixed(1)].join(","));
   }
   return rows.join("\n");
 }
