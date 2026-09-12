@@ -243,6 +243,18 @@ body{
       <h3>Timing</h3>
       <div class="opt">
         <div>
+          <div class="n">Start</div>
+          <p>Standing waits for a dead stop. Rolling arms at speed and starts the clock when you
+             floor it &#8212; that is how a comparable 100&#8211;200 is measured. Begin the pull
+             from below the lower figure, around 80&#160;km/h.</p>
+        </div>
+        <div class="seg" role="group" aria-label="Start type">
+          <button id="st-stand" aria-pressed="true">Standing</button>
+          <button id="st-roll" aria-pressed="false">Rolling</button>
+        </div>
+      </div>
+      <div class="opt">
+        <div>
           <div class="n">Rollout</div>
           <p>Starts the clock after 1 ft of travel, like a drag strip beam. Off = true standstill, the way Dragy and car magazines quote 0&#8211;100.</p>
         </div>
@@ -343,6 +355,9 @@ var DIST = [
 var SPD_KMH = [50,60,80,100,130,160,200];
 var SPD_MPH = [30,50,60,80,100,120];
 var SENS = {lo:0.55, md:1.0, hi:1.8};
+// Rolling intervals. Traction-independent, so these read power rather than tyres.
+var ROLL_KMH = [[60,100],[80,120],[100,150],[100,200]];
+var ROLL_MPH = [[40,80],[50,70],[60,100],[60,130]];
 
 /* ============================================================
    state
@@ -365,7 +380,7 @@ var S = {
   t0:0, tArm:0,
   run:null,                  // currently displayed run
   runs:[],
-  cfg:{rollout:false, units:"kmh", sens:"md"},
+  cfg:{rollout:false, units:"kmh", sens:"md", start:"standing"},
   wake:null, watch:null
 };
 
@@ -404,15 +419,21 @@ function deviceName(){
    demo run so the page opens in a working state
    ============================================================ */
 function demoRun(){
-  // curve fitted to a plausible hot-hatch pass: ~6.3 s to 100, 400 m in ~14.5 s.
-  // Carried out past 1000 m so every distance on the slip has a figure.
-  var pk = 54.33, tc = 8.8, samples = [], t = 0, v = 0, s = 0;
-  while(t < 29.5){
-    var target = pk * (1 - Math.exp(-t/tc));
-    v = target * (1 - 0.055*Math.exp(-t/0.35));
-    s += v * 0.02;
+  // Power-limited with aero drag and a traction cap, plus four DSG shifts. A curve
+  // fitted to two headline numbers goes badly wrong at the top end, which matters
+  // now that the slip reaches 200 km/h and 1000 m.
+  var m = 1430, Pw = 258*0.7457*0.82*1000, rho = 1.10, CdA = 0.62, Crr = 0.013, aMax = 5.4;
+  var shifts = [[13.9,0.18],[24.5,0.16],[37.5,0.16],[50.5,0.16]];   // m/s, seconds
+  var samples = [{t:0, v:0, s:0}], dt = 0.02, t = 0, v = 0, s = 0, se = 0, si = 0;
+  while(t < 34 && v < 65){
+    var drag = (0.5*rho*CdA*v*v + Crr*m*9.81)/m, acc;
+    if(t < se){ acc = -drag; }
+    else {
+      if(si < shifts.length && v >= shifts[si][0]){ se = t + shifts[si][1]; si++; continue; }
+      acc = Math.min(aMax, v > 0.5 ? Pw/(m*v) : aMax) - drag;
+    }
+    v = Math.max(0, v + acc*dt); s += v*dt; t += dt;
     samples.push({t:t, v:v, s:s});
-    t += 0.02;
   }
   var r = measure(samples, 0);
   r.id = "demo"; r.demo = true; r.dev = "Sample"; r.when = null;
@@ -457,7 +478,16 @@ function measure(sm, tRoll){
     var d = atDist(sm, DIST[k].m);
     out.dist[DIST[k].k] = d ? {t:Math.max(0, d.t - tRoll), v:d.v} : null;
   }
+  // Rolling intervals are differences, so rollout never enters into them.
+  out.roll = {};
+  var rl = S.cfg.units === "mph" ? ROLL_MPH : ROLL_KMH, cf = S.cfg.units === "mph" ? 2.2369362921 : 3.6;
+  for(var q=0;q<rl.length;q++){
+    var A = atSpeed(sm, rl[q][0]/cf), B = atSpeed(sm, rl[q][1]/cf);
+    out.roll[rl[q][0]+"-"+rl[q][1]] = (A && B) ? B.t - A.t : null;
+  }
+
   out.tRoll = tRoll;
+  out.start = S.startType || "standing";
   return out;
 }
 
@@ -559,8 +589,10 @@ function detectLaunch(now){
     t0 = S.buf[i].t;
   }
 
-  S.t0 = t0; S.v = 0; S.s = 0; S.bias = 0; S.divT = 0; S.lastCorr = 0; S.vpk = 0;
-  S.samples = [{t:0, v:0, s:0}]; S.vHist = [];
+  S.t0 = t0; S.s = 0; S.bias = 0; S.divT = 0; S.lastCorr = 0; S.vpk = 0;
+  // a rolling pull starts from whatever GPS says we are already doing
+  S.v = S.startType === "rolling" ? (S.gps.v || 0) : 0;
+  S.samples = [{t:0, v:S.v, s:0}]; S.vHist = [];
   setPhase("running");
   hint("Recording…");
 
@@ -639,6 +671,18 @@ function gpsSample(t, v){
     var n = S.gpsTrack.length;
     if(n < 2) return;
     var a = S.gpsTrack[n-2], b = S.gpsTrack[n-1];
+    if(S.startType === "rolling"){
+      // no standstill to trigger on, so look for the throttle going down
+      if((b.v - a.v)/((b.t - a.t)||1e-9) > 1.5){
+        S.t0 = a.t;
+        S.samples = [{t:0, v:a.v, s:0}];
+        S.vpk = 0;
+        setPhase("running");
+        hint("Recording — GPS only…");
+        gpsRebuild();
+      }
+      return;
+    }
     // first fix that is clearly moving, with the previous one clearly stopped
     if(a.v < 0.6 && b.v >= 1.2){
       var acc = (b.v - a.v)/((b.t - a.t)||1e-9);
@@ -657,9 +701,12 @@ function gpsSample(t, v){
 }
 
 function gpsRebuild(){
-  var xs = [S.t0], ys = [0], i;
+  var xs = [], ys = [], i, rolling = S.startType === "rolling";
+  if(!rolling){ xs.push(S.t0); ys.push(0); }   // a standing run is anchored at zero
   for(i=0;i<S.gpsTrack.length;i++){
-    if(S.gpsTrack[i].t > S.t0){ xs.push(S.gpsTrack[i].t); ys.push(S.gpsTrack[i].v); }
+    if(rolling ? S.gpsTrack[i].t >= S.t0 : S.gpsTrack[i].t > S.t0){
+      xs.push(S.gpsTrack[i].t); ys.push(S.gpsTrack[i].v);
+    }
   }
   if(xs.length < 2) return;
   var f = pchip(xs, ys);
@@ -764,15 +811,20 @@ function abort(msg){
 function arm(){
   if(S.gps.acc === null){ hint("Waiting for a GPS fix…", true); return; }
   if(S.gps.acc > 25){ hint("GPS is still fuzzy (±"+Math.round(S.gps.acc)+" m). Wait for green.", true); return; }
-  if(S.gps.v !== null && kmh(S.gps.v) > 5){ hint("Come to a complete stop first.", true); return; }
+  S.startType = S.cfg.start;
+  if(S.startType === "standing" && S.gps.v !== null && kmh(S.gps.v) > 5){
+    hint("Come to a complete stop first.", true); return;
+  }
   if(S.launchCheck) clearTimeout(S.launchCheck);
   S.buf = []; S.samples = []; S.gpsTrack = []; S.v = 0; S.s = 0; S.bias = 0; S.gN = 0;
   S.divT = 0; S.lastCorr = 0; S.vpk = 0;
   S.mode = S.imuHz > 10 ? "imu" : "gps";
   S.tArm = performance.now()/1000;
   setPhase("armed");
-  hint(S.mode === "imu" ? "Hold still — calibrating, then launch."
-                        : "GPS-only mode. Come to a full stop, then launch.");
+  hint(S.startType === "rolling"
+        ? "Hold a steady speed below the interval, then floor it."
+        : (S.mode === "imu" ? "Hold still — calibrating, then launch."
+                            : "GPS-only mode. Come to a full stop, then launch."));
 }
 
 function requestWake(){
@@ -822,20 +874,46 @@ function slipHTML(r){
                 '<p class="empty">No run yet.<br>Arm the timer and launch.</p>';
   var unitLabel = r.units === "mph" ? "mph" : "km/h";
   var conv = r.units === "mph" ? mph : kmh;
-  var heroA = r.units === "mph" ? (r.spd[60] != null ? r.spd[60] : null) : (r.spd[100] != null ? r.spd[100] : null);
-  var heroAL = r.units === "mph" ? "0–60 mph" : "0–100 km/h";
+  var rolling = r.start === "rolling";
+  var rl = r.units === "mph" ? ROLL_MPH : ROLL_KMH;
+  var big = rl[rl.length-1], bigK = big[0]+"-"+big[1];          // 100–200, or 60–130 mph
+  var heroA = rolling ? (r.roll ? r.roll[bigK] : null)
+                      : (r.units === "mph" ? r.spd[60] : r.spd[100]);
+  var heroAL = rolling ? big[0]+"–"+big[1]+" "+unitLabel
+                       : (r.units === "mph" ? "0–60 mph" : "0–100 km/h");
   var q = r.dist["400 m"];
 
   var h = "";
   h += '<div class="sliphead"><span class="t">Timeslip</span>'+
        (r.demo ? '<span class="tag demo">Demo — sample data</span>'
-               : '<span class="tag">'+r.dev+(r.mode==="gps"?" · GPS only":"")+(r.rollout?" · 1 ft rollout":" · no rollout")+'</span>')+
+               : '<span class="tag">'+r.dev+(rolling?" · rolling":"")+(r.mode==="gps"?" · GPS only":"")+
+                 (rolling?"":(r.rollout?" · 1 ft rollout":" · no rollout"))+'</span>')+
        '</div>';
 
   h += '<div class="hero">'+
          '<div><b>'+(heroA!=null?f2(heroA):"—")+'</b><small>'+heroAL+'</small></div>'+
-         '<div><b>'+(q?f2(q.t):"—")+'</b><small>400 m'+(q?" · "+conv(q.v).toFixed(1)+" "+unitLabel:"")+'</small></div>'+
+         (rolling
+           ? '<div><b>'+conv(r.vmax).toFixed(0)+'</b><small>peak '+unitLabel+'</small></div>'
+           : '<div><b>'+(q?f2(q.t):"—")+'</b><small>400 m'+(q?" · "+conv(q.v).toFixed(1)+" "+unitLabel:"")+'</small></div>')+
        '</div>';
+
+  // rolling intervals — meaningful on every run, and the honest read on power
+  h += '<div class="grp"><span class="lbl">Rolling · '+unitLabel+'</span>';
+  for(var p=0;p<rl.length;p++){
+    var rk = rl[p][0]+"-"+rl[p][1], rv = r.roll ? r.roll[rk] : null;
+    h += '<div class="row'+(rv==null?" none":"")+'"><span class="k">'+rl[p][0]+'–'+rl[p][1]+'</span>'+
+         '<span class="lead"></span><span class="v">'+fmtT(rv)+'</span></div>';
+  }
+  h += '</div>';
+
+  if(rolling){
+    h += '<div class="grp"><span class="lbl">Run</span>'+
+         '<div class="row"><span class="k">Peak speed</span><span class="lead"></span>'+
+         '<span class="v">'+conv(r.vmax).toFixed(1)+" "+unitLabel+'</span></div>'+
+         '<div class="row"><span class="k">Distance covered</span><span class="lead"></span>'+
+         '<span class="v">'+Math.round(r.samples[r.samples.length-1].s)+' m</span></div></div>';
+    return h;   // standing-start figures are meaningless from a rolling pull
+  }
 
   // speed milestones
   var list = r.units === "mph" ? SPD_MPH : SPD_KMH;
@@ -999,9 +1077,21 @@ setInterval(function(){ S.imuHz = S.imuN; S.imuN = 0; }, 1000);
    text export (the sandbox blocks downloads, so: clipboard)
    ============================================================ */
 function slipText(r){
+  var NL = String.fromCharCode(10);
   var conv = r.units === "mph" ? mph : kmh, u = r.units === "mph" ? "mph" : "km/h";
   var L = ["POCKET TIMESLIP  " + (r.when ? new Date(r.when).toLocaleString() : "sample"),
-           r.dev + (r.rollout ? "  |  1 ft rollout" : "  |  no rollout"), ""];
+           r.dev + (r.start === "rolling" ? "  |  rolling start"
+                              : (r.rollout ? "  |  1 ft rollout" : "  |  no rollout")), ""];
+  var rl = r.units === "mph" ? ROLL_MPH : ROLL_KMH;
+  for(var p=0;p<rl.length;p++){
+    var rk = rl[p][0]+"-"+rl[p][1];
+    if(r.roll && r.roll[rk] != null) L.push((rl[p][0]+"-"+rl[p][1]+" "+u).padEnd(16) + f2(r.roll[rk]) + " s");
+  }
+  if(r.start === "rolling"){
+    L.push("", "Peak".padEnd(16) + conv(r.vmax).toFixed(1) + " " + u);
+    return L.join(NL);
+  }
+  L.push("");
   var list = r.units === "mph" ? SPD_MPH : SPD_KMH;
   for(var i=0;i<list.length;i++) if(r.spd[list[i]] != null)
     L.push(("0-"+list[i]+" "+u).padEnd(16) + f2(r.spd[list[i]]) + " s");
@@ -1016,12 +1106,13 @@ function slipText(r){
   return L.join("\n");
 }
 function csvText(){
-  var rows = ["when,device,mode,units,rollout,0-100kmh,0-60mph,60ft,100m,1/8mi,400m,1/4mi,1/2mi,1000m,trap_400m_kmh,trap_1000m_kmh,peak_kmh"];
+  var rows = ["when,device,mode,start,units,rollout,100-200kmh,0-100kmh,0-60mph,60ft,100m,1/8mi,400m,1/4mi,1/2mi,1000m,trap_400m_kmh,trap_1000m_kmh,peak_kmh"];
   for(var i=0;i<S.runs.length;i++){
     var r = S.runs[i];
     function d(k){ return r.dist[k] ? f2(r.dist[k].t) : ""; }
     var q = r.dist["400 m"], km = r.dist["1000 m"];
-    rows.push([new Date(r.when).toISOString(), r.dev, r.mode || "imu", r.units, r.rollout?1:0,
+    rows.push([new Date(r.when).toISOString(), r.dev, r.mode || "imu", r.start || "standing", r.units, r.rollout?1:0,
+               (r.roll && r.roll["100-200"] != null) ? f2(r.roll["100-200"]) : "",
                r.spd[100]!=null?f2(r.spd[100]):"", r.spd[60]!=null?f2(r.spd[60]):"",
                d("60 ft"), d("100 m"), d("1/8 mile"), d("400 m"), d("1/4 mile"),
                d("1/2 mile"), d("1000 m"),
@@ -1105,9 +1196,12 @@ function init(){
     S.run = S.runs[+b.dataset.i]; render(); view("run");
   });
 
+  seg([["st-stand","standing"],["st-roll","rolling"]], function(){ return S.cfg.start; }, function(v){ S.cfg.start = v; });
   seg([["ro-off",false],["ro-on",true]], function(){ return S.cfg.rollout; }, function(v){ S.cfg.rollout = v; });
   seg([["u-kmh","kmh"],["u-mph","mph"]], function(){ return S.cfg.units; }, function(v){ S.cfg.units = v; });
   seg([["s-lo","lo"],["s-md","md"],["s-hi","hi"]], function(){ return S.cfg.sens; }, function(v){ S.cfg.sens = v; });
+  $("st-stand").setAttribute("aria-pressed", String(S.cfg.start === "standing"));
+  $("st-roll").setAttribute("aria-pressed", String(S.cfg.start === "rolling"));
   $("ro-on").setAttribute("aria-pressed", String(S.cfg.rollout));
   $("ro-off").setAttribute("aria-pressed", String(!S.cfg.rollout));
   $("u-kmh").setAttribute("aria-pressed", String(S.cfg.units === "kmh"));
