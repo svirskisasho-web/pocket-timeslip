@@ -284,6 +284,13 @@ body{
         <br><br>
         Expect within <b>±0.1&#8211;0.3&#160;s</b> of a 10&#160;Hz Dragy box on 0&#8211;100, and better than that
         run-to-run. Good for A/B testing a map, fuel or tyres; not a timing certificate.
+        <br><br>
+        If the phone gives no motion events &#8212; the IMU chip reads <code>off</code> &#8212; it falls back to
+        <b>GPS-only timing</b>. Launch is then taken from the first moving fix, backtracked to
+        standstill, and the speed curve is resampled at 50&#160;Hz with a monotone cubic before the
+        distances are integrated. Slightly softer on the start line, perfectly usable: figure on
+        <b>±0.2&#8211;0.4&#160;s</b>. Runs recorded this way are labelled <b>GPS only</b> on the slip, so
+        never compare one against a fused run.
       </div>
     </div>
 
@@ -350,7 +357,9 @@ var S = {
   samples:[],                // during run: {t, v, s}
   vHist:[],                  // {t,v} for latency-aware GPS correction
   gps:{v:null, acc:null, t:0, lat:null, lon:null, n:0},
-  imuN:0, imuHz:0, gpsHz:0,
+  imuN:0, imuHz:0, gpsHz:0, imuEver:false,
+  mode:"imu",                // imu = fused; gps = GPS-only fallback
+  gpsTrack:[],               // {t,v} fixes, used by the GPS-only path
   t0:0, tArm:0,
   run:null,                  // currently displayed run
   runs:[],
@@ -432,7 +441,7 @@ function atDist(sm, target){
 // Builds a full result object from a sample list. tRoll is the time origin shift.
 function measure(sm, tRoll){
   var out = {samples:sm, spd:{}, dist:{}, vmax:0, when:Date.now(), dev:deviceName(),
-             rollout:S.cfg.rollout, units:S.cfg.units, id:String(Date.now())};
+             rollout:S.cfg.rollout, units:S.cfg.units, mode:S.mode, id:String(Date.now())};
   for(var i=0;i<sm.length;i++) if(sm[i].v > out.vmax) out.vmax = sm[i].v;
 
   var list = S.cfg.units==="mph" ? SPD_MPH : SPD_KMH;
@@ -469,7 +478,8 @@ function finishRun(){
    ============================================================ */
 function onMotion(e){
   var now = performance.now()/1000;
-  S.imuN++;
+  S.imuN++; S.imuEver = true;
+  if(S.mode === "gps") return;
 
   var a = e.accelerationIncludingGravity;
   var haveG = a && a.x !== null && a.x !== undefined;
@@ -581,9 +591,93 @@ function vAt(t){
   return h[0].t > t ? h[0].v : h[h.length-1].v;
 }
 
+/* ============================================================
+   GPS-only path, used when the device gives us no motion events.
+   At 1-3 Hz the raw fixes are too coarse to read a milestone off
+   directly, so the speed curve is resampled at 50 Hz with a
+   monotone cubic (Fritsch-Carlson) that will not invent the
+   overshoot a plain spline would, then integrated for distance.
+   ============================================================ */
+function pchip(xs, ys){
+  var n = xs.length, d = [], m = [], i;
+  if(n < 3){
+    return function(x){
+      if(n < 2) return ys[0] || 0;
+      var f = (x - xs[0])/((xs[1]-xs[0])||1e-9);
+      return ys[0] + f*(ys[1]-ys[0]);
+    };
+  }
+  for(i=0;i<n-1;i++) d[i] = (ys[i+1]-ys[i])/((xs[i+1]-xs[i])||1e-9);
+  m[0] = d[0]; m[n-1] = d[n-2];
+  for(i=1;i<n-1;i++){
+    if(d[i-1]*d[i] <= 0){ m[i] = 0; }
+    else {
+      var w1 = 2*(xs[i+1]-xs[i]) + (xs[i]-xs[i-1]);
+      var w2 = (xs[i+1]-xs[i]) + 2*(xs[i]-xs[i-1]);
+      m[i] = (w1+w2)/((w1/d[i-1]) + (w2/d[i]));
+    }
+  }
+  return function(x){
+    var lo = 0, hi = n-1;
+    if(x <= xs[0]) return ys[0];
+    if(x >= xs[n-1]) return ys[n-1];
+    while(hi - lo > 1){ var mid = (lo+hi)>>1; if(xs[mid] <= x) lo = mid; else hi = mid; }
+    var h = xs[hi]-xs[lo], t = (x-xs[lo])/h, t2 = t*t, t3 = t2*t;
+    return ys[lo]*(2*t3-3*t2+1) + h*m[lo]*(t3-2*t2+t) + ys[hi]*(-2*t3+3*t2) + h*m[hi]*(t3-t2);
+  };
+}
+
+function gpsSample(t, v){
+  S.gpsTrack.push({t:t, v:v});
+  if(S.gpsTrack.length > 400) S.gpsTrack.shift();
+
+  if(S.phase === "armed"){
+    var n = S.gpsTrack.length;
+    if(n < 2) return;
+    var a = S.gpsTrack[n-2], b = S.gpsTrack[n-1];
+    // first fix that is clearly moving, with the previous one clearly stopped
+    if(a.v < 0.6 && b.v >= 1.2){
+      var acc = (b.v - a.v)/((b.t - a.t)||1e-9);
+      S.t0 = b.t - b.v/(acc || 1e-9);          // straight-line backtrack to v = 0
+      if(S.t0 < a.t) S.t0 = a.t;
+      if(S.t0 > b.t) S.t0 = b.t;
+      S.samples = [{t:0, v:0, s:0}];
+      setPhase("running");
+      hint("Recording — GPS only…");
+      gpsRebuild();
+    }
+    return;
+  }
+  if(S.phase === "running") gpsRebuild();
+}
+
+function gpsRebuild(){
+  var xs = [S.t0], ys = [0], i;
+  for(i=0;i<S.gpsTrack.length;i++){
+    if(S.gpsTrack[i].t > S.t0){ xs.push(S.gpsTrack[i].t); ys.push(S.gpsTrack[i].v); }
+  }
+  if(xs.length < 2) return;
+  var f = pchip(xs, ys);
+  var end = xs[xs.length-1] - S.t0;
+  var sm = [], step = 0.02, s = 0, vPrev = 0, t;
+  for(t = 0; t <= end + 1e-9; t += step){
+    var v = Math.max(0, f(S.t0 + t));
+    s += 0.5*(vPrev + v)*step;
+    vPrev = v;
+    sm.push({t:t, v:v, s:s});
+  }
+  S.samples = sm;
+  S.v = vPrev; S.s = s;
+
+  var last = DIST[DIST.length-1].m;
+  if(end > 45 || (end > 3 && vPrev < 1) || s > last + 12) finishRun();
+}
+
 function onPos(p){
   var c = p.coords;
   var tPerf = (p.timestamp + S.perfOff)/1000;
+  // some devices hand back a GNSS clock rather than an epoch; ignore it if it is nonsense
+  if(!isFinite(tPerf) || Math.abs(tPerf - performance.now()/1000) > 10) tPerf = performance.now()/1000;
   var prev = S.gps.t;
   S.gps.acc = c.accuracy;
   S.gps.n++;
@@ -600,6 +694,11 @@ function onPos(p){
   }
   S.gps.lat = c.latitude; S.gps.lon = c.longitude;
   if(v !== null) S.gps.v = v;
+
+  if(S.mode === "gps"){
+    if(v !== null) gpsSample(tPerf, v);
+    return;
+  }
 
   if(S.phase === "running" && v !== null){
     var K = c.accuracy && c.accuracy < 8 ? 0.45 : 0.22;
@@ -650,10 +749,12 @@ function arm(){
   if(S.gps.acc > 25){ hint("GPS is still fuzzy (±"+Math.round(S.gps.acc)+" m). Wait for green.", true); return; }
   if(S.gps.v !== null && kmh(S.gps.v) > 5){ hint("Come to a complete stop first.", true); return; }
   if(S.launchCheck) clearTimeout(S.launchCheck);
-  S.buf = []; S.samples = []; S.v = 0; S.s = 0; S.bias = 0; S.gN = 0;
+  S.buf = []; S.samples = []; S.gpsTrack = []; S.v = 0; S.s = 0; S.bias = 0; S.gN = 0;
+  S.mode = S.imuHz > 10 ? "imu" : "gps";
   S.tArm = performance.now()/1000;
   setPhase("armed");
-  hint("Hold still — calibrating, then launch.");
+  hint(S.mode === "imu" ? "Hold still — calibrating, then launch."
+                        : "GPS-only mode. Come to a full stop, then launch.");
 }
 
 function requestWake(){
@@ -683,6 +784,11 @@ function start(){
     S.started = true;
     setPhase("idle");
     hint("Waiting for a clean GPS fix…");
+    setTimeout(function(){
+      if(!S.imuEver && S.phase === "idle"){
+        hint("No motion sensor here — timing on GPS alone. Still works.");
+      }
+    }, 3000);
   }).catch(function(){
     hint("Motion access denied. On iPhone: Settings › Apps › Safari › Motion & Orientation Access.", true);
   });
@@ -705,7 +811,7 @@ function slipHTML(r){
   var h = "";
   h += '<div class="sliphead"><span class="t">Timeslip</span>'+
        (r.demo ? '<span class="tag demo">Demo — sample data</span>'
-               : '<span class="tag">'+r.dev+(r.rollout?" · 1 ft rollout":" · no rollout")+'</span>')+
+               : '<span class="tag">'+r.dev+(r.mode==="gps"?" · GPS only":"")+(r.rollout?" · 1 ft rollout":" · no rollout")+'</span>')+
        '</div>';
 
   h += '<div class="hero">'+
@@ -855,8 +961,8 @@ function tick(){
   $("d-acc").className = "dot " + (acc === null ? "" : acc <= 5 ? "ok" : acc <= 15 ? "warn" : "bad");
   $("v-gps").textContent = S.gps.n ? S.gpsHz.toFixed(1)+" Hz" : "--";
   $("d-gps").className = "dot " + (S.gps.n ? (S.gpsHz > 0.7 ? "ok" : "warn") : "bad");
-  $("v-imu").textContent = S.imuHz ? Math.round(S.imuHz)+" Hz" : "--";
-  $("d-imu").className = "dot " + (S.imuHz > 40 ? "ok" : S.imuHz > 0 ? "warn" : "bad");
+  $("v-imu").textContent = S.imuHz ? Math.round(S.imuHz)+" Hz" : (S.started && !S.imuEver ? "off" : "--");
+  $("d-imu").className = "dot " + (S.imuHz > 40 ? "ok" : S.imuHz > 0 ? "warn" : (S.started && !S.imuEver ? "warn" : "bad"));
 
   requestAnimationFrame(tick);
 }
