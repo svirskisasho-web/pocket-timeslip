@@ -555,7 +555,7 @@ function detectLaunch(now){
     t0 = S.buf[i].t;
   }
 
-  S.t0 = t0; S.v = 0; S.s = 0; S.bias = 0;
+  S.t0 = t0; S.v = 0; S.s = 0; S.bias = 0; S.divT = 0; S.lastCorr = 0;
   S.samples = [{t:0, v:0, s:0}]; S.vHist = [];
   setPhase("running");
   hint("Recording…");
@@ -708,6 +708,14 @@ function onPos(p){
       var span = Math.max(0.3, tPerf - (S.lastCorr || S.t0));
       S.bias = Math.max(-2.5, Math.min(2.5, S.bias - 0.25*err/span));
     }
+    // Dead reckoning that GPS never confirms is drift, not speed. If the fused
+    // estimate insists we are much faster than GPS for a sustained stretch, the
+    // accelerometer has run away and the run is worthless.
+    if(err < -4){
+      if(!S.divT) S.divT = tPerf;
+      else if(tPerf - S.divT > 2.5){ abort("Sensor drift — run discarded."); return; }
+    } else { S.divT = 0; }
+
     S.lastCorr = tPerf;
   }
 }
@@ -739,7 +747,7 @@ function hint(t, bad){ var h=$("hint"); h.textContent = t || ""; h.classList.tog
 
 function abort(msg){
   if(S.launchCheck) clearTimeout(S.launchCheck);
-  S.samples = []; S.buf = []; S.v = 0; S.s = 0;
+  S.samples = []; S.buf = []; S.v = 0; S.s = 0; S.divT = 0;
   setPhase("armed");
   hint(msg || "Aborted.", true);
 }
@@ -750,6 +758,7 @@ function arm(){
   if(S.gps.v !== null && kmh(S.gps.v) > 5){ hint("Come to a complete stop first.", true); return; }
   if(S.launchCheck) clearTimeout(S.launchCheck);
   S.buf = []; S.samples = []; S.gpsTrack = []; S.v = 0; S.s = 0; S.bias = 0; S.gN = 0;
+  S.divT = 0; S.lastCorr = 0;
   S.mode = S.imuHz > 10 ? "imu" : "gps";
   S.tArm = performance.now()/1000;
   setPhase("armed");
